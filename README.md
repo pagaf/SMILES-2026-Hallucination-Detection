@@ -4,7 +4,7 @@ Detect whether a small language model's answer is *hallucinated* (fabricated) or
 
 The model is **[Qwen/Qwen2.5-0.5B](https://huggingface.co/Qwen/Qwen2.5-0.5B)** — a 24‑layer causal LM with hidden size 896.
 
-**Primary competition metric:** Accuracy on the held‑out `test.csv`. Internally, I focus on AUROC as a more informative metric for the probe quality.
+**Primary competition metric:** Accuracy on the held‑out `test.csv`. Internally, I also track AUROC as a more informative metric for the probe quality.
 
 ---
 
@@ -22,8 +22,8 @@ Tested with:
 Install dependencies:
 
 ```bash
-git clone https://github.com/ahdr3w/SMILES-HALLUCINATION-DETECTION.git
-cd SMILES-HALLUCINATION-DETECTION
+git clone https://github.com/pagaf/SMILES-2026-Hallucination-Detection.git
+cd SMILES-2026-Hallucination-Detection
 
 python -m venv .venv
 source .venv/bin/activate        # Linux / macOS
@@ -93,7 +93,7 @@ def aggregate(hidden_states, attention_mask):
     return last_layer[last_pos]                # (hidden_dim,)
 ```
 
-This is the standard “CLS/last token” probing setup widely used in probing literature and in hallucination‑detection work such as INSIDE/EigenScore [web:101][web:211]. It already performed well in my experiments, giving test AUROC ~72–73% with a good probe.
+This is the standard “CLS/last token” probing setup widely used in probing literature and in hallucination‑detection work such as INSIDE / EigenScore [web:101][web:211]. It already performed well in my experiments, giving test AUROC around 72–73% with a good probe.
 
 **Compact geometric features (6 dims)**
 
@@ -105,23 +105,28 @@ On top of this 896‑dimensional base vector, I append a **6‑dimensional geome
 The implemented features:
 
 1. **L2 Norm of the last token on the final layer**  
-   - Captures the activation magnitude at the point where the model finishes its answer.
-2. **L2 Norm of the last token on the penultimate layer**  
-   - Provides a reference magnitude slightly earlier in the computation.
-3. **Cosine similarity between last token at layers −1 and −2**  
-   - Measures how much the representation changes in the final step (“representation drift”). Large drift indicates instability or uncertainty about the answer.
-4. **Cosine similarity between last token at layers −2 and −4**  
-   - Captures a slightly longer‑range drift in late layers.
-5. **Spectral entropy of the per‑sequence Gram matrix (EigenScore proxy)**  
-   - I take all non‑padding token vectors from the last layer, center them, compute the Gram matrix, obtain its eigenvalues, and compute
-     \[
-     H = -\sum_i p_i \log p_i,\quad p_i = \lambda_i / \sum_j \lambda_j
-     \]
-     Higher entropy corresponds to more diffuse / uncertain representations, in line with EigenScore’s intuition [web:101][web:147].
-6. **Maximum eigenvalue of the Gram matrix**  
-   - Captures the dominant variance direction; high values reflect highly concentrated variance, which may correspond to more “confident” states.
+   Captures the activation magnitude at the point where the model finishes its answer.
 
-Code (simplified):
+2. **L2 Norm of the last token on the penultimate layer**  
+   Provides a reference magnitude slightly earlier in the computation.
+
+3. **Cosine similarity between last token at layers −1 and −2**  
+   Measures how much the representation changes in the final step (“representation drift”). Large drift indicates instability or uncertainty about the answer.
+
+4. **Cosine similarity between last token at layers −2 and −4**  
+   Captures a slightly longer‑range drift in late layers.
+
+5. **Spectral entropy of the per‑sequence Gram matrix (EigenScore proxy)**  
+   I take all non‑padding token vectors from the last layer, center them, compute the Gram matrix, obtain its eigenvalues, and compute
+   \[
+   H = -\sum_i p_i \log p_i,\quad p_i = \lambda_i / \sum_j \lambda_j
+   \]
+   Higher entropy corresponds to more diffuse / uncertain representations, in line with EigenScore’s intuition [web:101][web:147].
+
+6. **Maximum eigenvalue of the Gram matrix**  
+   Captures the dominant variance direction; high values reflect highly concentrated variance, which may correspond to more “confident” states.
+
+Code (simplified, matching the final implementation):
 
 ```python
 def extract_geometric_features(hidden_states, attention_mask):
@@ -155,6 +160,7 @@ def extract_geometric_features(hidden_states, attention_mask):
         gram = torch.mm(centered, centered.T) / (n_real - 1)
         eigvals = torch.linalg.eigvalsh(gram).float()
         eigvals = torch.clamp(eigvals, min=1e-8)
+
         max_eigval = eigvals.max().unsqueeze(0)
 
         eig_sum = eigvals.sum()
@@ -173,7 +179,6 @@ def extract_geometric_features(hidden_states, attention_mask):
         max_eigval,
     ], dim=0)
 
-    # log1p stabilises scale before probe + StandardScaler
     return torch.log1p(geometric_feats)
 ```
 
@@ -181,7 +186,7 @@ The final feature vector is:
 
 - **Dimensionality:** 896 (base) + 6 (geometric) = **902**.
 
-The choice of *only 6* geometric dimensions is deliberate: in earlier experiments, adding dozens of geometric features (layer‑wise norms, full drift curves, multiple spectral statistics) inflated the feature dimensionality to 2600+ and caused severe overfitting on only 689 samples (train AUROC ~100%, test AUROC ~52–53%). By contrast, this compact set captures the key geometric signals identified in the literature [web:101][web:147][web:203] while remaining statistically stable.
+The choice of *only 6* geometric dimensions is deliberate: in earlier experiments, adding dozens of geometric features (layer‑wise norms, full drift curves, multiple spectral statistics) inflated the feature dimensionality to 2600+ and caused severe overfitting on only 689 samples (train AUROC ≈ 1.0, test AUROC ≈ 0.52–0.55). By contrast, this compact set captures the key geometric signals identified in the literature [web:101][web:147][web:203] while remaining statistically stable.
 
 ### 2.3. `probe.py` — the hallucination classifier
 
@@ -210,7 +215,7 @@ Rationale:
   - Up to 100 epochs.
   - Stop if training loss does not improve for 12 epochs.
 
-Code sketch:
+Code sketch (simplified, matching the final implementation):
 
 ```python
 class HallucinationProbe(nn.Module):
@@ -233,6 +238,11 @@ class HallucinationProbe(nn.Module):
             nn.Linear(128, 1),
         )
 
+    def forward(self, x):
+        if self._net is None:
+            raise RuntimeError("Call fit() before forward().")
+        return self._net(x).squeeze(-1)
+
     def fit(self, X, y):
         X_scaled = self._scaler.fit_transform(X)
         if self._net is None:
@@ -245,9 +255,11 @@ class HallucinationProbe(nn.Module):
         n_neg = len(y) - n_pos
         pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32)
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-        optimizer = torch.optim.AdamW(self.parameters(),
-                                      lr=5e-4,
-                                      weight_decay=1e-3)
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=5e-4,
+            weight_decay=1e-3,
+        )
 
         self.train()
         max_epochs = 100
@@ -292,4 +304,83 @@ On the validation split, I tune the decision threshold to maximize F1:
   - all unique predicted probabilities, and
   - a coarse grid `linspace(0, 1, 201)`.
 - Pick the threshold with the best F1 on validation.
-- Store it 
+- Store it in `self._threshold` and use it in `predict`.
+
+---
+
+## 3. Experiments and Failed Attempts
+
+### 3.1. Multi-layer concatenation (large feature vectors)
+
+I first tried concatenating mean‑pooled representations from multiple upper layers, e.g.:
+
+- last 3 or 4 transformer layers,
+- sometimes both last token and mean‑pooled tokens per layer.
+
+This increased the feature dimension from 896 up to ~2700. While the train AUROC often reached ≈100%, the test AUROC dropped to ~52–53%, barely above random. This matches the warning from hallucination‑detection surveys that high‑capacity probes with large feature spaces can easily overfit small labeled datasets [web:218].
+
+**Outcome:** Discarded. The model overfitted strongly; I returned to a single‑layer base (last token of last layer) plus a small number of well‑motivated geometric features.
+
+### 3.2. Heavy geometric feature sets (layer-wise norms, full drift curves)
+
+I implemented richer geometric descriptors:
+
+- Layer‑wise mean and std of token L2 norms across all layers.
+- Full representation‑drift curves: cosine similarity between consecutive layers for the last token.
+- Multiple spectral statistics beyond entropy and max eigenvalue.
+
+This again pushed the feature dimensionality well above 2k. Although the approach was theoretically motivated by ICR‑style probing and EigenScore [web:101][web:147][web:203], in practice:
+
+- Train AUROC was close to 1.0.
+- Test AUROC degraded to ≈0.52–0.55.
+
+**Outcome:** Discarded. The features were too many and too noisy for 689 examples. The final model keeps only 6 carefully chosen geometric scalars.
+
+### 3.3. More complex probe architectures (residual blocks, label smoothing)
+
+I experimented with:
+
+- deeper MLPs with residual connections;
+- more aggressive bottlenecks and label smoothing.
+
+These architectures occasionally matched the 72–73% AUROC baseline, but were not consistently better and sometimes underperformed due to optimization instability on such a small dataset. In line with probing best practices [web:145], I opted for the simplest architecture that achieved the highest AUROC reliably.
+
+**Outcome:** Discarded for the final submission. The 2‑layer MLP with BatchNorm + Dropout was both simpler and consistently strong.
+
+---
+
+## 4. Final Results
+
+On the provided single stratified split, my final configuration (last token + 6 geometric features + 2‑layer MLP probe) achieves:
+
+- **Test AUROC:** **75.56%**
+- Test Accuracy: **73.08%**
+- Test F1: **80.82%**
+- Train AUROC: **98.02%**
+- Feature dimensionality: **902**
+- Total labelled samples: **689**
+
+(The exact numbers above come from `results.json`:
+`avg_test_auroc = 0.7556`, `avg_test_accuracy ≈ 0.7308`, `avg_test_f1 ≈ 0.8082`.)
+
+The improvement from ~72–73% AUROC (strong baseline with only last token) to **75.56%** comes from a small number of theoretically motivated geometric features inspired by recent work on internal‑state‑based hallucination detection and spectral feature analysis [web:101][web:127][web:147][web:203].
+
+---
+
+## 5. Files Modified
+
+I only modified:
+
+1. **`aggregation.py`**
+   - Base aggregation: last real token of the final layer (dim = 896).
+   - Added a 6‑dimensional geometric feature extractor based on:
+     - L2 norms at late layers,
+     - inter‑layer cosine drift,
+     - spectral entropy and max eigenvalue of the last‑layer Gram matrix.
+
+2. **`probe.py`**
+   - Implemented `HallucinationProbe` as a 2‑layer MLP with BatchNorm, Dropout, and AdamW.
+   - Added threshold tuning on validation data (`fit_hyperparameters`).
+   - Kept the required public interface (`fit`, `fit_hyperparameters`, `predict`, `predict_proba`).
+
+All other infrastructure files (`model.py`, `evaluate.py`, `splitting.py`, `solution.py`) are used as provided in the starter kit, ensuring the solution is fully reproducible with a single `python solution.py` run.
